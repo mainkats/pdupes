@@ -1,0 +1,479 @@
+#!/usr/bin/env python
+# vim: ts=4 autoindent expandtab
+
+import os
+import sys
+import stat
+import time
+import Queue
+import base64
+import curses
+import hashlib
+import optparse
+import threading
+import multiprocessing
+import collections
+
+
+# version
+VERSION = '0.0'
+
+
+class Stats:
+    '''
+    Statistics class, so we don't have to global all that
+    '''
+    def __init__(self):
+        self.Iteration      = 0
+        self.FilesFound     = 0
+        self.DirsFound      = 0
+        self.InodesFound    = 0
+        self.InodesSkipped  = 0
+        self.InodesLeft     = 0
+        self.InodedHashed   = 0
+
+
+def work_dir(dir):
+    '''
+    Process a directory
+    '''
+    global VERBOSE, QUEUE, STATS, FILES, FILESLOCK
+
+    # process the contents of the directory
+    STATS.DirsFound += 1
+    try:
+        for entry in os.listdir(dir):
+            fn = os.path.join(dir, entry)
+            st = os.lstat(fn)
+
+            # directory? add to processing queue
+            if stat.S_ISDIR(st[stat.ST_MODE]):
+                QUEUE.put((1, fn))
+
+            # regular file? add information to FILES hash
+            elif stat.S_ISREG(st[stat.ST_MODE]):
+
+                # we found a regular file
+                with FILESLOCK:
+                    STATS.FilesFound += 1
+                    size = st[stat.ST_SIZE]
+                    node = '%x:%x' % (st[stat.ST_DEV], st[stat.ST_INO])
+
+                    # add the size entry to the FILES dict
+                    sizeentry = FILES.setdefault(st[stat.ST_SIZE], {})
+
+                    # add the node entry to the FILES[size][dev] dict
+                    nodeentry = sizeentry.setdefault(node,
+                                                   {'size': size, 'path': []})
+                    if not nodeentry['path']:
+                        STATS.InodesFound += 1
+                    nodeentry['path'].append(fn)
+
+            else:
+                STATS.InodesSkipped += 1
+                # VERBOSE.append('Skipping special file \'%s\'' % fn)
+
+    except OSError:
+        VERBOSE.append('WARNING: Something went wrong processing directory '
+                       '\'%s\', ignoring.' % dir)
+
+
+def work_node(node):
+    '''
+    Process a file node and hash its contents
+    '''
+    global VERBOSE, QUEUE, STATS
+
+    # open first filename from node
+    filename = node['path'][0]
+    try:
+        filehandle = os.open(filename, os.O_RDONLY)
+        if CHUNK_START:
+            os.lseek(filehandle, CHUNK_START, os.SEEK_SET)
+    except OSError:
+
+        # remove filename we could not open from list
+        del node['path'][0]
+        VERBOSE.append('Could not open file \'%s\', removing' % filename)
+
+        # if there are alternative filenames to this inode requeue this item
+        if node['path']:
+            QUEUE.put((2, node))
+        return
+
+    # calculate size of chunk to read
+    filesize = node['size']
+    if CHUNK_START + CHUNK_SIZE > node['size']:
+        toread = node['size'] - CHUNK_START
+    else:
+        toread = CHUNK_SIZE
+
+    # read file chunk
+    try:
+        chunk = os.read(filehandle, toread)
+    except OSError:
+        pass
+
+    # close the filehandle and check if we read enough
+    os.close(filehandle)
+    if (toread > len(chunk)):
+
+        # remove filename we could not read from list
+        del node['path'][0]
+        VERBOSE.append('WARNING: Could not read file \'%s\', removing' %
+                       filename)
+
+        # if there are alternative filenames to this inode requeue this item
+        if node['path']:
+            QUEUE.put((2, node))
+        return
+
+    # add/update hashes
+    sha1 = node.setdefault('sha1', hashlib.sha1())
+    md5  = node.setdefault('md5',  hashlib.md5())
+
+    sha1.update(chunk)
+    md5.update(chunk)
+
+    # done for this node/chunk pair
+    STATS.InodesHashed += 1
+
+
+def worker():
+    '''
+    Worker thread. Dispatches items in the queue to processing functions.
+    '''
+    global QUEUE
+    while 1:
+        (type, arg) = QUEUE.get()
+        if type == 1:
+            work_dir(arg)
+        elif type == 2:
+            work_node(arg)
+        else:
+            QUEUE.task_done()
+            break
+        QUEUE.task_done()
+
+
+def proc_args():
+    '''
+    Process command line arguments and store the options and directories in
+    the worker queue.
+    '''
+    global QUEUE
+    global NUM_THREADS, OUTPUT_CURSES, OUTPUT_VERBOSE, OUTPUT_FILENAME
+
+    cores = multiprocessing.cpu_count()
+    parser = optparse.OptionParser(version=VERSION,
+                                   usage='Usage: %prog [OPTION] DIRECTORY ...',
+                                   description='Find identical files in '
+                                   'DIRECTORY and its subdirectories.')
+    parser.add_option('-f', '--filename', metavar="FILE",
+                      help='Output to FILE. Default is output to STDOUT.')
+    parser.add_option('-p', '--parallel',
+                      type='int', dest='num', default=cores * 2,
+                      help='Run NUM threads in parallel. Default is the '
+                           'number of detected CPU cures times two. '
+                           '(Detected: %i cores)' % cores)
+    parser.add_option('-c', '--curses',
+                      action='store_true', dest='curses', default=False,
+                      help='Enable CURSES mode. (Default: false. Needs an '
+                      'explicit output file.)')
+    parser.add_option('-v', '--verbose',
+                      action='store_true', dest='verbose', default=False,
+                      help='Enable verbose output on STDERR. (Default: false)')
+    (opts, args) = parser.parse_args()
+
+    # do nothing if nothing to do
+    if not args:
+        parser.print_help()
+        sys.exit(0)
+
+    # store information from option parsing
+    NUM_THREADS     = opts.num
+    OUTPUT_CURSES   = opts.curses
+    OUTPUT_VERBOSE  = opts.verbose
+    OUTPUT_FILENAME = opts.filename
+
+    # curses needs file output
+    if opts.curses and not opts.filename:
+        sys.stderr.write('ERROR: Curses output needs an output file.\n')
+        sys.exit(1)
+
+    # check all arguments for a directory
+    for arg in args:
+        if os.path.isdir(arg):
+            QUEUE.put((1, arg))
+        else:
+            sys.stderr.write('ERROR: \'%s\' is not a directory.\n' % arg)
+            sys.exit(1)
+
+
+def proc_verbose(newline=False):
+    '''
+    Check if we have verbose output available, and process it
+    '''
+    global VERBOSE
+    if VERBOSE:
+        if OUTPUT_VERBOSE:
+            if newline:
+                sys.stderr.write('\n')
+            while VERBOSE:
+                sys.stderr.write(VERBOSE.popleft() + '\n')
+                sys.stderr.flush()
+        else:
+            VERBOSE.clear()
+
+
+def dirscan():
+    '''
+    Scan the directories for size/inodes
+    '''
+    global QUEUE, STATS, VERBOSE
+
+    # wait until the worker queue is empty
+    while not QUEUE.empty():
+        time.sleep(0.2)
+
+        # print periodic output
+        sys.stderr.write('Scanning: %i files in %i dirs (%i unique inodes' \
+                         % (STATS.FilesFound,
+                            STATS.DirsFound,
+                            STATS.InodesFound))
+        if STATS.InodesSkipped:
+            sys.stderr.write(', %i skipped)\r' % STATS.InodesSkipped)
+        else:
+            sys.stderr.write(')\r')
+        sys.stderr.flush()
+
+        # check if we have verbose output
+        proc_verbose(True)
+
+    # make sure the queue is really empty and all verbose output is processed
+    QUEUE.join()
+    proc_verbose()
+
+    # print final statistics
+    sys.stderr.write('Scanned:  %i files in %i dirs (%i unique inodes' \
+                     % (STATS.FilesFound, STATS.DirsFound, STATS.InodesFound))
+    if STATS.InodesSkipped:
+        sys.stderr.write(', %i skipped)\n' % STATS.InodesSkipped)
+    else:
+        sys.stderr.write(')\n')
+    sys.stderr.flush()
+
+
+def hashscan():
+    '''
+    Scan file sizes and file contents
+    '''
+    global FILES, QUEUE, STATS, VERBOSE
+
+    # clean out FILES array
+    pruned = 0
+    for size in FILES.keys():
+        for node in FILES[size].keys():
+
+            # prune node with no more paths left
+            if not FILES[size][node]['path']:
+                del FILES[size][node]
+                pruned += 1
+
+        # prune filesizes with no or one nodes left
+        if len(FILES[size]) < 2:
+            pruned += len(FILES[size])
+            del FILES[size]
+
+    if pruned:
+        STATS.InodesLeft -= pruned
+        sys.stderr.write('Removed:  %i unique node sizes\n' % pruned)
+        sys.stderr.flush()
+
+    # push every remaining size/node pair into the work queue
+    STATS.InodesHashed = 0
+    for size, sizedata in FILES.iteritems():
+        for node, nodedata in sizedata.iteritems():
+            QUEUE.put((2, nodedata))
+
+    # wait until the worker queue is empty
+    while not QUEUE.empty():
+        time.sleep(0.2)
+
+        # print periodic output
+        sys.stderr.write('Hashing: %i@%i bytes - %i of %i nodes\r' \
+                         % (CHUNK_SIZE, CHUNK_START,
+                            STATS.InodesHashed, STATS.InodesLeft))
+        sys.stderr.flush()
+
+        # check if we have verbose output
+        proc_verbose(True)
+
+    # make sure the queue is really empty and all verbose output is processed
+    QUEUE.join()
+    proc_verbose()
+
+    # print final stats
+    sys.stderr.write('Hashed:  %i@%i bytes - %i of %i files\n' \
+                     % (CHUNK_SIZE, CHUNK_START,
+                        STATS.InodesHashed, STATS.InodesLeft))
+    sys.stderr.flush()
+
+
+def hashprune():
+    '''
+    Clean out unique size/hash pairs in the table
+    '''
+    global FILES, QUEUE, STATS, VERBOSE
+
+    # check for each size how many file hashes are unique
+    pruned  = 0
+    output  = 0
+    maxsize = CHUNK_START + CHUNK_SIZE
+    for size, sizedata in sorted(FILES.iteritems()):
+
+        # store a combined hash > [count, node] dict
+        hashcount = {}
+        for node, nodedata in sizedata.iteritems():
+            hash = nodedata['sha1'].digest() + nodedata['md5'].digest()
+            hashentry = hashcount.setdefault(hash, [])
+            hashentry.append(node)
+
+        # check how many unique node are for any hash
+        for hash, nodelist in hashcount.iteritems():
+
+            # if the hash is unique so should be the file
+            if len(nodelist) == 1:
+                del FILES[size][nodelist[0]]
+                pruned += 1
+
+            # if the file size is less than the current maxsize it is a dupe
+            elif size <= maxsize:
+                dupoutput(size, hash, nodelist)
+                output += len(nodelist)
+                for node in nodelist:
+                    del FILES[size][node]
+
+    # print output message
+    if pruned:
+        STATS.InodesLeft -= pruned
+        sys.stderr.write('Removed:  %i unique file hashes\n' % pruned)
+        sys.stderr.flush()
+
+    # remove processed files
+    STATS.InodesLeft -= output
+
+
+def dupoutput(size, hash, nodelist):
+    '''
+    Print out a nodelist of duplicate files of the same size
+    '''
+    global FILES
+
+    print "--- %i bytes ---[ %s ]---" % (size, base64.b64encode(hash))
+    num = 0
+    for node in nodelist:
+        num += 1
+        for path in FILES[size][node]['path']:
+            info = node.split(':')
+            print "%4i  %8s %8s  %s" % (num, info[0], info[1], path)
+
+
+# =============================================================================
+
+def main():
+    '''
+    Hic sunt dracones.
+    '''
+    global QUEUE, STATS, VERBOSE, CHUNK_START, CHUNK_SIZE
+
+    # start worker threads
+    sys.stderr.write('Starting %i worker threads ' % NUM_THREADS)
+    sys.stderr.flush()
+    for n in range(NUM_THREADS):
+        wt = threading.Thread(target=worker)
+        wt.daemon = True
+        wt.start()
+        sys.stderr.write('.')
+        sys.stderr.flush()
+    sys.stderr.write(' done\n')
+    sys.stderr.flush()
+
+    # initial directory scan
+    dirscan()
+    STATS.InodesLeft = STATS.InodesFound
+
+    # prune all files with zero byte length
+    if 0 in FILES:
+        pruned = len(FILES[0])
+        STATS.InodesLeft -= pruned
+        del FILES[0]
+        sys.stderr.write('Removed:  %i nodes with zero length\n' % pruned)
+        sys.stderr.flush()
+
+    # loop until there are no more files
+    while FILES:
+        STATS.Iteration += 1
+
+        hashscan()
+        hashprune()
+
+        # note the next chunk block
+        CHUNK_START += CHUNK_SIZE
+
+        # double the hash chunk size every two hash iterations until
+        # MAX_CHUNK_SIZE is reached
+        if STATS.Iteration % 2 == 0 and CHUNK_SIZE < MAX_CHUNK_SIZE:
+            CHUNK_SIZE *= 2
+
+    # signal worker threads to quit
+    sys.stderr.write('Stopping %i worker threads ' % NUM_THREADS)
+    sys.stderr.flush()
+    for n in range(NUM_THREADS):
+        QUEUE.put((0, None))
+        sys.stderr.write('.')
+        sys.stderr.flush()
+    QUEUE.join()
+    sys.stderr.write(' done\n')
+
+    for size in sorted(FILES.keys()):
+        print size
+        for node, data in FILES[size].iteritems():
+            print "%10s " % node, data['path']
+            if 'sha1' in data:
+                print '  SHA1: ', data['sha1'].hexdigest()
+            if 'md5' in data:
+                print '   MD5: ', data['md5'].hexdigest()
+
+# =============================================================================
+
+# current hash chunk start position and size
+CHUNK_SIZE  = 4096
+CHUNK_START = 0
+MAX_CHUNK_SIZE = 4 * 1024 * 1024
+
+# output modes
+OUTPUT_CURSES   = False
+OUTPUT_VERBOSE  = False
+OUTPUT_FILENAME = None
+
+# main work queue (consisting of tuples) and global stats object
+QUEUE = Queue.Queue()
+STATS = Stats()
+
+# verbosity output buffer
+VERBOSE = collections.deque()
+
+# global files dict, sorted by filesize
+FILES     = {}
+FILESLOCK = threading.Lock()
+
+# process command line arguments
+proc_args()
+
+# start the output in a curses wrapper if curses output is enabled
+if OUTPUT_CURSES:
+    # curses.wrapper(main)
+    sys.stderr.write('Curses output not supported yet\n')
+else:
+    main()
