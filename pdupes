@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 # vim: ts=4 autoindent expandtab
+'''
+Multithreaded duplicate file checker in Python
+'''
+
 
 import os
 import sys
@@ -14,10 +18,8 @@ import threading
 import multiprocessing
 import collections
 
-
 # version
 VERSION = '0.0'
-
 
 class Stats:
     '''
@@ -31,6 +33,9 @@ class Stats:
         self.InodesSkipped  = 0
         self.InodesLeft     = 0
         self.InodedHashed   = 0
+        self.SetsDuplicate  = 0
+        self.FilesDuplicate = 0
+        self.BytesDuplicate = 0
 
 
 def work_dir(dir):
@@ -53,7 +58,8 @@ def work_dir(dir):
             # regular file? add information to FILES hash
             elif stat.S_ISREG(st[stat.ST_MODE]):
 
-                # we found a regular file
+                # we found a regular file - it looks like dict operations
+                # sometimes have issues with multithreading, so keep a lock
                 with FILESLOCK:
                     STATS.FilesFound += 1
                     size = st[stat.ST_SIZE]
@@ -63,11 +69,10 @@ def work_dir(dir):
                     sizeentry = FILES.setdefault(st[stat.ST_SIZE], {})
 
                     # add the node entry to the FILES[size][dev] dict
-                    nodeentry = sizeentry.setdefault(node,
-                                                   {'size': size, 'path': []})
-                    if not nodeentry['path']:
+                    nodeentry = sizeentry.setdefault(node, [size, [], '', ''])
+                    if not nodeentry[1]:
                         STATS.InodesFound += 1
-                    nodeentry['path'].append(fn)
+                    nodeentry[1].append(fn)
 
             else:
                 STATS.InodesSkipped += 1
@@ -85,7 +90,7 @@ def work_node(node):
     global VERBOSE, QUEUE, STATS
 
     # open first filename from node
-    filename = node['path'][0]
+    filename = node[1][0]
     try:
         filehandle = os.open(filename, os.O_RDONLY)
         if CHUNK_START:
@@ -93,18 +98,17 @@ def work_node(node):
     except OSError:
 
         # remove filename we could not open from list
-        del node['path'][0]
+        del node[1][0]
         VERBOSE.append('Could not open file \'%s\', removing' % filename)
 
         # if there are alternative filenames to this inode requeue this item
-        if node['path']:
+        if node[1]:
             QUEUE.put((2, node))
         return
 
     # calculate size of chunk to read
-    filesize = node['size']
-    if CHUNK_START + CHUNK_SIZE > node['size']:
-        toread = node['size'] - CHUNK_START
+    if CHUNK_START + CHUNK_SIZE > node[0]:
+        toread = node[0] - CHUNK_START
     else:
         toread = CHUNK_SIZE
 
@@ -119,21 +123,24 @@ def work_node(node):
     if (toread > len(chunk)):
 
         # remove filename we could not read from list
-        del node['path'][0]
+        del node[1][0]
         VERBOSE.append('WARNING: Could not read file \'%s\', removing' %
                        filename)
 
         # if there are alternative filenames to this inode requeue this item
-        if node['path']:
+        if node[1]:
             QUEUE.put((2, node))
         return
 
-    # add/update hashes
-    sha1 = node.setdefault('sha1', hashlib.sha1())
-    md5  = node.setdefault('md5',  hashlib.md5())
-
+    # create chunk hash: SHA1
+    sha1 = hashlib.sha1()
     sha1.update(chunk)
+    node[2] = sha1.digest()
+
+    # create chunk hash: MD5
+    md5  = hashlib.md5()
     md5.update(chunk)
+    node[3] = md5.digest()
 
     # done for this node/chunk pair
     STATS.InodesHashed += 1
@@ -163,6 +170,7 @@ def proc_args():
     '''
     global QUEUE
     global NUM_THREADS, OUTPUT_CURSES, OUTPUT_VERBOSE, OUTPUT_FILENAME
+    global PRUNEDIR
 
     cores = multiprocessing.cpu_count()
     parser = optparse.OptionParser(version=VERSION,
@@ -171,7 +179,7 @@ def proc_args():
                                    'DIRECTORY and its subdirectories.')
     parser.add_option('-f', '--filename', metavar="FILE",
                       help='Output to FILE. Default is output to STDOUT.')
-    parser.add_option('-p', '--parallel',
+    parser.add_option('-n', '--threads',
                       type='int', dest='num', default=cores * 2,
                       help='Run NUM threads in parallel. Default is the '
                            'number of detected CPU cures times two. '
@@ -183,6 +191,8 @@ def proc_args():
     parser.add_option('-v', '--verbose',
                       action='store_true', dest='verbose', default=False,
                       help='Enable verbose output on STDERR. (Default: false)')
+    parser.add_option('-p', '--prunedir', metavar='DIR',
+                      help='Weed out duplicates from subdirectory DIR')
     (opts, args) = parser.parse_args()
 
     # do nothing if nothing to do
@@ -195,13 +205,20 @@ def proc_args():
     OUTPUT_CURSES   = opts.curses
     OUTPUT_VERBOSE  = opts.verbose
     OUTPUT_FILENAME = opts.filename
+    PRUNEDIR        = opts.prunedir
 
     # curses needs file output
     if opts.curses and not opts.filename:
         sys.stderr.write('ERROR: Curses output needs an output file.\n')
         sys.exit(1)
 
-    # check all arguments for a directory
+    # check prunedir
+    if PRUNEDIR:
+        if not os.path.isdir(PRUNEDIR):
+            sys.stderr.write('ERROR: \'%s\' is not a directory.\n' % PRUNEDIR)
+            sys.exit(1)
+
+    # check all remaining arguments to be directories
     for arg in args:
         if os.path.isdir(arg):
             QUEUE.put((1, arg))
@@ -276,7 +293,7 @@ def hashscan():
         for node in FILES[size].keys():
 
             # prune node with no more paths left
-            if not FILES[size][node]['path']:
+            if not FILES[size][node][1]:
                 del FILES[size][node]
                 pruned += 1
 
@@ -323,6 +340,7 @@ def hashscan():
 def hashprune():
     '''
     Clean out unique size/hash pairs in the table
+    TODO: Maybe parallelize hashcount dict creation per node size
     '''
     global FILES, QUEUE, STATS, VERBOSE
 
@@ -335,7 +353,7 @@ def hashprune():
         # store a combined hash > [count, node] dict
         hashcount = {}
         for node, nodedata in sizedata.iteritems():
-            hash = nodedata['sha1'].digest() + nodedata['md5'].digest()
+            hash = nodedata[2] + nodedata[3]
             hashentry = hashcount.setdefault(hash, [])
             hashentry.append(node)
 
@@ -368,15 +386,33 @@ def dupoutput(size, hash, nodelist):
     '''
     Print out a nodelist of duplicate files of the same size
     '''
-    global FILES
+    global STATS
 
     print "--- %i bytes ---[ %s ]---" % (size, base64.b64encode(hash))
     num = 0
+    prc = ''
     for node in nodelist:
         num += 1
-        for path in FILES[size][node]['path']:
+        for path in FILES[size][node][1]:
             info = node.split(':')
-            print "%4i  %8s %8s  %s" % (num, info[0], info[1], path)
+            if PRUNEDIR and not path.startswith(PRUNEDIR):
+                prc = '*'
+            print "%4i %8s %8s  %1s %s" % (num, info[0], info[1], prc, path)
+
+    # print rm line for all nodes in PRUNEDIR if at least
+    # one node is not in the PRUNEDIR
+    if PRUNEDIR and prc:
+        for node in nodelist:
+            for path in FILES[size][node][1]:
+                if path.startswith(PRUNEDIR):
+                    print '> rm \'%s\'' % path
+
+    # update statistics
+    STATS.SetsDuplicate  += 1
+    STATS.FilesDuplicate += num
+    STATS.BytesDuplicate += size * (num - 1)
+
+
 
 
 # =============================================================================
@@ -390,10 +426,10 @@ def main():
     # start worker threads
     sys.stderr.write('Starting %i worker threads ' % NUM_THREADS)
     sys.stderr.flush()
-    for n in range(NUM_THREADS):
-        wt = threading.Thread(target=worker)
-        wt.daemon = True
-        wt.start()
+    for _ in range(NUM_THREADS):
+        workerthread = threading.Thread(target=worker)
+        workerthread.daemon = True
+        workerthread.start()
         sys.stderr.write('.')
         sys.stderr.flush()
     sys.stderr.write(' done\n')
@@ -429,33 +465,35 @@ def main():
     # signal worker threads to quit
     sys.stderr.write('Stopping %i worker threads ' % NUM_THREADS)
     sys.stderr.flush()
-    for n in range(NUM_THREADS):
+    for _ in range(NUM_THREADS):
         QUEUE.put((0, None))
         sys.stderr.write('.')
         sys.stderr.flush()
     QUEUE.join()
     sys.stderr.write(' done\n')
 
-    for size in sorted(FILES.keys()):
-        print size
-        for node, data in FILES[size].iteritems():
-            print "%10s " % node, data['path']
-            if 'sha1' in data:
-                print '  SHA1: ', data['sha1'].hexdigest()
-            if 'md5' in data:
-                print '   MD5: ', data['md5'].hexdigest()
+    # Print duplicate stats
+    sys.stderr.write('Done: %i files in %i sets duplicate (%i bytes)\n' %
+                     (STATS.FilesDuplicate,
+                      STATS.SetsDuplicate,
+                      STATS.BytesDuplicate))
+    sys.stderr.flush()
 
 # =============================================================================
 
 # current hash chunk start position and size
 CHUNK_SIZE  = 4096
 CHUNK_START = 0
-MAX_CHUNK_SIZE = 4 * 1024 * 1024
+MAX_CHUNK_SIZE = 16 * 1024 * 1024
 
 # output modes
 OUTPUT_CURSES   = False
 OUTPUT_VERBOSE  = False
 OUTPUT_FILENAME = None
+
+# prune directories - if a duplicate is found within a directory path and at
+# least one duplicate is not within this directory path print an RM command
+PRUNEDIR        = ''
 
 # main work queue (consisting of tuples) and global stats object
 QUEUE = Queue.Queue()
